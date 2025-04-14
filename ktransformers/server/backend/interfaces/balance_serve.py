@@ -378,6 +378,7 @@ class BalanceServeInterface(BackendInterfaceBase):
 
             # Check cache for hit
             cached_response = self.response_cache.get(input_hash)
+            logger.debug(response_cache)
             if cached_response:
                 logger.info(f"[CACHE] HIT! Using cached response for input hash: {input_hash[:8]}...")
                 logger.debug(f"[CACHE] Cached response contains {len(cached_response)} tokens")
