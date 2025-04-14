@@ -1,4 +1,4 @@
-from typing import Any, AsyncIterator, List, Optional, Set
+from typing import Any, AsyncIterable, List, Optional, Set
 from ktransformers.models.custom_cache import KDeepSeekV3Cache
 from transformers import (
     AutoTokenizer,
@@ -39,6 +39,7 @@ import tempfile
 import asyncio
 import threading
 import hashlib
+from collections import OrderedDict
 from contextlib import asynccontextmanager
 from fastapi import FastAPI, Request
 import os
@@ -271,8 +272,8 @@ class BalanceServeInterface(BackendInterfaceBase):
 
         # Initialize response cache
         self.enable_response_cache = True
-        self.max_cache_size = 128000
-        self.response_cache = {}  # Map input hash -> generated tokens
+        self.max_cache_size = 128000  # Maximum number of entries in the cache
+        self.response_cache = OrderedDict()  # Use OrderedDict for LRU-like behavior
 
         logger.info(f"[CACHE] Response caching {'enabled' if self.enable_response_cache else 'disabled'}, max size: {self.max_cache_size}")
 
@@ -362,39 +363,49 @@ class BalanceServeInterface(BackendInterfaceBase):
         logger.debug(f"get input ids of shape {input_ids.shape}")
         return input_ids
 
+    def _create_cache_key(self, local_messages, temperature=None, top_p=None):
+        """Create a deterministic cache key for the given input"""
+        # Create a standardized string representation for hashing
+        if isinstance(local_messages, list):
+            input_str = str(local_messages)
+        else:
+            input_str = str(local_messages)
+
+        # Add parameters to the hash key
+        if temperature is not None:
+            input_str += f"_temp_{temperature}"
+        if top_p is not None:
+            input_str += f"_top_p_{top_p}"
+
+        return hashlib.md5(input_str.encode()).hexdigest()
+
     async def inference(self, local_messages, thread_id: str, temperature: Optional[float] = None, top_p: Optional[float] = None):
         # Generate a cache key for this input
         if self.enable_response_cache:
-            input_str = str(local_messages)
-            if temperature is not None:
-                input_str += f"_temp_{temperature}"
-            if top_p is not None:
-                input_str += f"_top_p_{top_p}"
+            input_hash = self._create_cache_key(local_messages, temperature, top_p)
 
-            input_hash = hashlib.md5(input_str.encode()).hexdigest()
-
-            logger.debug(f"[CACHE] Checking cache for input hash: {input_hash}")
+            logger.debug(f"[CACHE] Checking cache for input hash: {input_hash[:8]}...")
             logger.debug(f"[CACHE] Current cache size: {len(self.response_cache)} entries")
 
-            # Check cache for hit
+            # Check for cache hit
             cached_response = self.response_cache.get(input_hash)
-            logger.debug(self.response_cache)
             if cached_response:
                 logger.info(f"[CACHE] HIT! Using cached response for input hash: {input_hash[:8]}...")
                 logger.debug(f"[CACHE] Cached response contains {len(cached_response)} tokens")
 
+                # Get prefill time savings for logging
                 cached_prefill_time = next((item.prefill_time for item in cached_response if isinstance(item, RawUsage)), 0)
                 logger.info(f"[CACHE] Saved approximately {cached_prefill_time:.3f} seconds of prefill time")
 
                 # Return cached response
                 for item in cached_response:
-                    if isinstance(item, RawUsage):
-                        yield item
-                    else:
-                        yield item
+                    yield item
+
+                # Move this item to the end (most recently used)
+                self.response_cache.move_to_end(input_hash)
                 return
-            else:
-                logger.info(f"[CACHE] MISS! No cached response for input hash: {input_hash[:8]}...")
+
+            logger.info(f"[CACHE] MISS! No cached response for input hash: {input_hash[:8]}...")
 
         # No cache hit or caching disabled - proceed with normal inference
         profiler = Profiler()
@@ -496,10 +507,11 @@ class BalanceServeInterface(BackendInterfaceBase):
 
         # Add to cache if enabled
         if self.enable_response_cache:
+            # Simple LRU cache management - remove oldest if full
             if len(self.response_cache) >= self.max_cache_size:
-                oldest_key = list(self.response_cache.keys())[0]
+                oldest_key = next(iter(self.response_cache))
                 logger.debug(f"[CACHE] Cache full, removing oldest entry with hash: {oldest_key[:8]}...")
-                del self.response_cache[oldest_key]
+                self.response_cache.popitem(last=False)
 
             logger.info(f"[CACHE] Storing new response in cache with hash: {input_hash[:8]}...")
             logger.debug(f"[CACHE] Response contains {len(generated_responses)} tokens")
