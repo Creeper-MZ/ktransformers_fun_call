@@ -28,6 +28,8 @@ from ktransformers.server.balance_serve.inference.query_manager import QueryMana
 from ktransformers.server.balance_serve.inference.forward_batch import ForwardBatchInput, ForwardBatchOutput
 from ktransformers.server.balance_serve.sched_rpc import SchedulerClient
 from ktransformers.server.balance_serve.settings import sched_ext
+from torch.multiprocessing import Queue
+import torch.multiprocessing as mp
 from ktransformers.server.schemas.endpoints.chat import RawUsage
 from ktransformers.server.utils.multi_timer import Profiler
 import zmq
