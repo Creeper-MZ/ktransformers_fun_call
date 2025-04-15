@@ -1,12 +1,11 @@
 # Import necessary libraries
-# Corrected: Added Tuple to imports
 from typing import Any, AsyncIterable, List, Optional, Set, Dict, Tuple
 from ktransformers.models.custom_cache import KDeepSeekV3Cache # Assuming this exists and is relevant
 from transformers import (
     AutoTokenizer,
     AutoConfig,
     GenerationConfig,
-    StaticCache, # Keep StaticCache import if used elsewhere, but KDeepSeekV3Cache seems primary
+    StaticCache,
     AutoModelForCausalLM,
     BitsAndBytesConfig,
 )
@@ -17,7 +16,7 @@ import torch
 from ktransformers.server.backend.interfaces.transformers import (
     ConfigArgs,
     default_args,
-    TextStreamer, # Keep import if streamer is used elsewhere, but removed from core loop
+    TextStreamer, # Keep import
 )
 from ktransformers.server.schemas.base import ObjectID
 from ktransformers.server.config.log import logger
@@ -45,6 +44,7 @@ from collections import OrderedDict, defaultdict # Added defaultdict
 from contextlib import asynccontextmanager
 from fastapi import FastAPI, Request
 import os
+import concurrent.futures # Added for executor
 
 # Define rule paths (assuming these exist)
 ktransformer_rules_dir = (
@@ -55,24 +55,20 @@ default_optimize_rules = {
     "Qwen2MoeForCausalLM": ktransformer_rules_dir + "Qwen2-57B-A14B-Instruct-serve.yaml",
 }
 
-# Helper function to yield tokens from an asyncio queue
+# Helper function to yield tokens from an asyncio queue (Restored TextStreamer usage)
 async def chat_stream(queue: asyncio.Queue, tokenizer: AutoTokenizer):
     """Asynchronously yields decoded text from tokens received via a queue."""
-    # This helper might need adjustment if TextStreamer is fully removed,
-    # but it's not directly used by the core inference loop anymore.
-    # Keeping it simple for now.
+    streamer = TextStreamer(tokenizer) # Use streamer here
     while True:
         token = await queue.get()
         if token is None: # End signal
+            s = streamer.end()
+            if s:
+                yield s
             break
-        try:
-            # Attempt to decode single token ID
-            # Note: This might have issues with multi-token characters
-            decoded_text = tokenizer.decode([token], skip_special_tokens=True)
-            if decoded_text:
-                yield decoded_text
-        except Exception as e:
-            logger.warning(f"Error decoding token {token} in chat_stream helper: {e}")
+        decoded_text = streamer.put(token)
+        if decoded_text:
+            yield decoded_text # Yield only non-empty strings
 
 
 # Helper function to update query states after generation
@@ -447,12 +443,13 @@ class BalanceServeInterface(BackendInterfaceBase):
     args: ConfigArgs
     tokenizer: AutoTokenizer
     sched_client: SchedulerClient
-    # streamer: TextStreamer # Removed streamer instance variable
+    streamer: TextStreamer # Restored streamer instance variable
     token_queue: Queue # MP Queue from Engine
     active_prefills: Dict[str, asyncio.Future] # Hash -> Future[query_id]
     query_token_queues: Dict[str, List[asyncio.Queue]] # query_id -> List[consumer_queues]
     thread_map: Dict[str, str] # thread_id -> query_id
     proxy_lock: asyncio.Lock
+    executor: concurrent.futures.ThreadPoolExecutor # Added executor
 
     def __init__(self, args: ConfigArgs = default_args):
         self.args = args
@@ -482,13 +479,14 @@ class BalanceServeInterface(BackendInterfaceBase):
         self.token_queue = ctx.Queue(maxsize=10000) # Increased queue size
         self.tokenizer = AutoTokenizer.from_pretrained(args.model_dir, trust_remote_code=args.trust_remote_code)
         self.sched_client = SchedulerClient(args.sched_port)
-        # self.streamer = TextStreamer(self.tokenizer) # Removed streamer initialization
+        self.streamer = TextStreamer(self.tokenizer) # Re-initialize streamer
 
         # --- Attributes for prefill caching ---
         self.active_prefills = {}
         self.query_token_queues = defaultdict(list) # Maps query_id to list of consumer queues
         self.proxy_lock = asyncio.Lock() # To protect access to shared dictionaries
         # ---------------------------------
+        self.executor = None # Initialize executor later in lifespan
 
         # --- Start Engine Process ---
         start_event = ctx.Event()
@@ -561,6 +559,9 @@ class BalanceServeInterface(BackendInterfaceBase):
 
         # Clean up temporary IPC file
         self._cleanup_ipc_file()
+        # Shutdown executor
+        if hasattr(self, 'executor') and self.executor:
+            self.executor.shutdown(wait=False, cancel_futures=True)
 
 
     def format_and_tokenize_input_ids(self, thread_id: ObjectID, messages: List) -> torch.Tensor:
@@ -617,103 +618,81 @@ class BalanceServeInterface(BackendInterfaceBase):
         """Tokenizes a raw prompt string, returning a CPU tensor."""
         return self.tokenizer.encode(prompt, return_tensors="pt").cpu()
 
-    # --- UPDATED queue_proxy with batching ---
+    # --- UPDATED queue_proxy using run_in_executor ---
     async def queue_proxy(self):
-        """Forwards tokens from the main engine queue to specific consumer queues, using batching."""
-        logger.info("Queue Proxy Started - Batching Enabled")
-        batch_timeout = 0.005 # Max time to wait for more tokens after getting one (very short)
-        max_batch_size = 64  # Max tokens to process in one go
+        """Forwards tokens from the main engine queue to specific consumer queues using an executor."""
+        logger.info("Queue Proxy Started - Using Executor")
+        loop = asyncio.get_running_loop()
 
         while True:
-            tokens_batch = []
             try:
-                # Try to get the first token with a timeout
-                query_id, token = self.token_queue.get(timeout=0.1)
-                tokens_batch.append((query_id, token))
+                # Run the blocking get() in the executor thread pool
+                query_id, token = await loop.run_in_executor(
+                    self.executor,
+                    # Use a lambda to make self.token_queue.get callable by executor
+                    # Use a short timeout to avoid blocking the executor thread for too long
+                    lambda: self.token_queue.get(timeout=0.1)
+                )
 
-                # Try to get more tokens without waiting long (gather available tokens quickly)
-                start_time = time.time()
-                while len(tokens_batch) < max_batch_size and (time.time() - start_time) < batch_timeout:
-                    try:
-                        query_id_more, token_more = self.token_queue.get_nowait()
-                        tokens_batch.append((query_id_more, token_more))
-                    except queue.Empty:
-                        break # No more tokens immediately available
+                # Process the received token
+                async with self.proxy_lock:
+                    if query_id in self.query_token_queues:
+                        # logger.debug(f"Proxy: Got token {token} for query {query_id}. Distributing.")
+                        consumer_queues = self.query_token_queues[query_id][:] # Create copy
+                        for q in consumer_queues:
+                            try:
+                                q.put_nowait(token)
+                            except asyncio.QueueFull:
+                                logger.warning(f"Proxy: Consumer queue full for query {query_id}. Token {token} might be dropped.")
+                            except Exception as e:
+                                logger.error(f"Proxy: Error putting token {token} to consumer queue for query {query_id}: {e}")
+
+                        if token is None: # End signal
+                            # logger.debug(f"Proxy: End signal received for query {query_id}. Cleaning up.")
+                            # Remove entry after signaling all consumers
+                            self.query_token_queues.pop(query_id, None)
+                    # else:
+                    # logger.debug(f"Proxy: Received token for inactive/unknown query {query_id}. Discarding.")
 
             except queue.Empty:
-                # No tokens received during the initial timeout
-                await asyncio.sleep(0.02) # Sleep slightly longer if queue consistently empty
-                continue # Skip processing and try getting again
+                # Timeout occurred in executor's get(), yield control briefly
+                await asyncio.sleep(0.01)
+            except asyncio.CancelledError:
+                logger.info("Queue proxy task cancelled.")
+                break
             except Exception as e:
-                # Catch potential exceptions if the queue is closed during shutdown
-                if isinstance(e, (EOFError, BrokenPipeError)):
-                    logger.warning(f"Queue proxy encountered EOF/BrokenPipe, likely during shutdown: {e}")
-                    break # Exit loop on shutdown signal
-                logger.error(f"Error getting tokens in queue_proxy: {e}", exc_info=True)
+                # Catch potential exceptions if the queue/executor is closed during shutdown
+                if isinstance(e, (EOFError, BrokenPipeError, RuntimeError)):
+                    logger.warning(f"Queue proxy stopping due to expected error: {e}")
+                    break # Exit loop on shutdown or executor errors
+                logger.error(f"Error in queue_proxy: {e}", exc_info=True)
                 await asyncio.sleep(1) # Avoid rapid error loops
-                continue
 
-            # Process the collected batch
-            if tokens_batch:
-                # Group tokens by query_id for efficient distribution
-                grouped_tokens = defaultdict(list)
-                query_ids_with_end_signal = set()
-                for qid, tkn in tokens_batch:
-                    grouped_tokens[qid].append(tkn)
-                    if tkn is None:
-                        query_ids_with_end_signal.add(qid)
+        logger.info("Queue Proxy Stopped")
 
-                # Distribute tokens under lock
-                async with self.proxy_lock:
-                    for query_id, tokens in grouped_tokens.items():
-                        if query_id in self.query_token_queues:
-                            # logger.debug(f"Proxy: Distributing batch of {len(tokens)} tokens for query {query_id}.")
-                            # Distribute actual tokens first
-                            valid_tokens = [t for t in tokens if t is not None]
-                            if valid_tokens:
-                                # Get list of consumer queues for this query_id *once*
-                                consumer_queues = self.query_token_queues[query_id][:] # Create copy
-                                for q in consumer_queues:
-                                    for t in valid_tokens: # Put tokens individually
-                                        try:
-                                            q.put_nowait(t)
-                                        except asyncio.QueueFull:
-                                            logger.warning(f"Proxy: Consumer queue full for query {query_id}. Token {t} might be dropped.")
-                                        except Exception as e:
-                                            logger.error(f"Proxy: Error putting token {t} to consumer queue for query {query_id}: {e}")
-
-                            # Handle end signal if present in the batch for this query_id
-                            if query_id in query_ids_with_end_signal:
-                                # logger.debug(f"Proxy: End signal in batch for query {query_id}. Cleaning up.")
-                                consumer_queues_end = self.query_token_queues.get(query_id, [])[:] # Use .get and copy
-                                for q in consumer_queues_end:
-                                    try:
-                                        q.put_nowait(None) # Send end signal to consumers
-                                    except Exception as e:
-                                        logger.error(f"Proxy: Error putting None to consumer queue for query {query_id}: {e}")
-                                # Remove the entry after signaling all consumers
-                                self.query_token_queues.pop(query_id, None)
-                        # else:
-                        # logger.debug(f"Proxy: Received tokens for inactive/unknown query {query_id}. Discarding batch.")
-
-            # Minimal sleep to prevent busy-waiting if batches are constantly processed
-            # await asyncio.sleep(0.001) # Can potentially remove this if get(timeout=0.1) provides enough yielding
 
     @asynccontextmanager
     async def lifespan(self, app: FastAPI):
-        """Manages the queue proxy task using FastAPI's lifespan events."""
+        """Manages the executor and queue proxy task using FastAPI's lifespan events."""
+        self.executor = concurrent.futures.ThreadPoolExecutor(max_workers=5) # Adjust worker count if needed
+        logger.info("Thread pool executor created.")
         proxy_task = asyncio.create_task(self.queue_proxy())
         logger.info("Queue proxy task started via lifespan manager.")
-        yield
-        # Cleanup on shutdown
-        logger.info("Application shutting down. Cancelling proxy task...")
-        proxy_task.cancel()
         try:
-            await proxy_task
-        except asyncio.CancelledError:
-            logger.info("Queue proxy task successfully cancelled.")
-        except Exception as e:
-            logger.error(f"Error during proxy task cancellation: {e}", exc_info=True)
+            yield
+        finally:
+            # Cleanup on shutdown
+            logger.info("Application shutting down. Cancelling proxy task and shutting down executor...")
+            proxy_task.cancel()
+            try:
+                await proxy_task
+            except asyncio.CancelledError:
+                logger.info("Queue proxy task successfully cancelled.")
+            except Exception as e:
+                logger.error(f"Error during proxy task cancellation/await: {e}", exc_info=True)
+            # Shutdown executor gracefully
+            self.executor.shutdown(wait=True) # Wait for threads to finish
+            logger.info("Executor shutdown complete.")
 
 
     async def _get_token_stream(self, query_id: str) -> AsyncIterable[int]:
@@ -745,17 +724,16 @@ class BalanceServeInterface(BackendInterfaceBase):
                         pass # Queue already removed, ignore
 
 
+    # --- Restored TextStreamer usage in inference ---
     async def inference(self, local_messages, thread_id: str, temperature: Optional[float] = None, top_p: Optional[float] = None) -> AsyncIterable[Tuple[str, Optional[str]] | RawUsage]:
-        """Handles inference requests, utilizing prefill caching."""
+        """Handles inference requests, utilizing prefill caching and TextStreamer."""
         # 1. Calculate Hash
         m = hashlib.sha256()
         m.update(str(local_messages).encode())
-        # Include relevant generation parameters in the hash
         temp_to_hash = temperature if temperature is not None else self.args.temperature
         top_p_to_hash = top_p if top_p is not None else self.args.top_p
         m.update(str(temp_to_hash).encode())
         m.update(str(top_p_to_hash).encode())
-        # Consider adding other params like max_new_tokens if they affect prefill state
         prompt_hash = m.hexdigest()
 
         query_id_to_use = None
@@ -765,19 +743,16 @@ class BalanceServeInterface(BackendInterfaceBase):
         # 2. Check Cache / Start New Prefill (Atomic Check)
         async with self.proxy_lock:
             if prompt_hash in self.active_prefills:
-                # logger.info(f"Prefill Cache HIT for hash {prompt_hash[:8]}...")
                 query_id_future = self.active_prefills[prompt_hash]
             else:
-                # logger.info(f"Prefill Cache MISS for hash {prompt_hash[:8]}. Starting new prefill.")
                 is_original_request = True
                 query_id_future = asyncio.Future()
                 self.active_prefills[prompt_hash] = query_id_future
 
         # 3. Process Request
         if is_original_request:
-            # --- This is the first request for this prompt hash ---
-            profiler_orig = Profiler() # Profiler for the original request
-            actual_query_id = None # Initialize to None
+            profiler_orig = Profiler()
+            actual_query_id = None
             prefill_timer_running = False
             decode_timer_running = False
             try:
@@ -789,134 +764,100 @@ class BalanceServeInterface(BackendInterfaceBase):
                     input_ids = self.tokenize_prompt(local_messages)
                 else:
                     raise ValueError("local_messages should be List or str")
+                if input_ids.numel() == 0: raise ValueError("Tokenization resulted in empty input.")
 
-                if input_ids.numel() == 0:
-                    raise ValueError("Tokenization resulted in empty input.")
-
-
-                # --- Force Think Token (if enabled) ---
+                # --- Force Think Token ---
                 if Config().user_force_think:
-                    input_ids = input_ids.cpu() # Ensure on CPU
+                    input_ids = input_ids.cpu()
                     think_tokens = self.tokenizer.encode("<think>\n", add_special_tokens=False)
                     token_thinks = torch.tensor([think_tokens], dtype=torch.long)
                     input_ids = torch.cat([input_ids, token_thinks], dim=1)
-
                 profiler_orig.pause_timer("tokenize")
 
                 # --- Prepare QueryAdd ---
                 query_add = sched_ext.QueryAdd()
-                query_add.query_token = input_ids[0].cpu().tolist() # Send list of ints
+                query_add.query_token = input_ids[0].cpu().tolist()
                 query_length = len(query_add.query_token)
                 query_add.query_length = query_length
                 profiler_orig.set_counter("prefill", query_length)
-
-                # Define stop criteria (ensure tokens are ints)
                 stop_criteria_tokens = [
                     self.tokenizer.encode(self.tokenizer.eos_token, add_special_tokens=False) if self.tokenizer.eos_token else [],
-                    self.tokenizer.encode("<|im_end|>", add_special_tokens=False) # Add other common stop tokens if needed
+                    self.tokenizer.encode("<|im_end|>", add_special_tokens=False)
                 ]
-                # Filter out empty lists if eos_token is None
                 query_add.stop_criteria = [tokens for tokens in stop_criteria_tokens if tokens]
-
-
-                # Set sampling parameters, ensuring they are not zero
                 temp = temperature if temperature is not None else self.args.temperature
                 tp = top_p if top_p is not None else self.args.top_p
                 query_add.sample_options.temperature = max(0.0001, temp)
                 query_add.sample_options.top_p = max(0.0001, tp)
-
-                # Estimate length, ensuring it's valid
                 query_add.estimated_length = min(self.args.cache_lens, query_length + self.args.max_new_tokens)
                 if query_add.estimated_length <= query_add.query_length:
-                    # Adjust if max_new_tokens is too small or zero
-                    query_add.estimated_length = query_length + 1 # Ensure at least one token can be generated
+                    query_add.estimated_length = query_length + 1
                     logger.warning(f"Adjusted estimated_length for query {thread_id} as initial estimate was too small.")
-                    # Alternatively, raise error if query_length already exceeds cache_lens
-                    if query_length >= self.args.cache_lens:
-                        raise ValueError(f"Query length ({query_length}) exceeds cache length ({self.args.cache_lens}).")
+                    if query_length >= self.args.cache_lens: raise ValueError(f"Query length ({query_length}) exceeds cache length ({self.args.cache_lens}).")
 
                 # --- Start Prefill Timer ---
                 profiler_orig.create_and_start_timer("prefill")
                 prefill_timer_running = True
 
-
                 # --- Add Query to Scheduler ---
                 actual_query_id = self.sched_client.add_query(query_add)
-                # logger.info(f"New query added to scheduler with ID: {actual_query_id} for hash {prompt_hash[:8]}")
                 self.thread_map[thread_id] = actual_query_id
                 query_id_to_use = actual_query_id
-
-                # Signal waiting tasks by setting the Future's result
                 query_id_future.set_result(actual_query_id)
 
                 # --- Start Streaming Results ---
                 if Config().user_force_think:
-                    yield '<think>\n', None # Yield think token immediately
+                    yield '<think>\n', None
 
-                # Removed streamer reset as it's not used in the loop
-                # self.streamer.reset()
+                streamer = TextStreamer(self.tokenizer) # Use local streamer instance
+                streamer.reset()
                 token_count = 0
-                prefill_finished = False # Track if prefill timer was paused
+                prefill_finished = False
 
                 async for token_id in self._get_token_stream(actual_query_id):
-                    # Prefill ends when the first token arrives from the engine
                     if not prefill_finished:
                         if prefill_timer_running:
                             profiler_orig.pause_timer("prefill")
                             prefill_timer_running = False
-                        # Start decode timer only once
                         if not decode_timer_running:
                             profiler_orig.create_and_start_timer("decode")
                             decode_timer_running = True
                             profiler_orig.set_counter("decode", 0)
                         prefill_finished = True
 
-                    # --- Direct Decoding and Yielding ---
-                    try:
-                        # Decode single token ID. Handle potential errors.
-                        token_text = self.tokenizer.decode([token_id], skip_special_tokens=True)
-                        if token_text: # Yield if decoding produces text
-                            yield token_text, None
-                    except Exception as decode_err:
-                        logger.warning(f"Error decoding token ID {token_id} for query {actual_query_id}: {decode_err}")
-                    # -------------------------------------
+                    # --- Use TextStreamer ---
+                    decoded_text = streamer.put(token_id)
+                    if decoded_text:
+                        yield decoded_text, None
+                    # -----------------------
 
-                    # Increment decode counter *after* the first token arrives
                     if prefill_finished:
                         profiler_orig.inc("decode")
                     token_count += 1
 
-
                 # --- Handle Final Token & Finish Reason ---
-                # Removed final streamer flush as streamer is not used in loop
-                # final_text = self.streamer.end()
-                # if final_text:
-                #     yield final_text, None
+                final_text = streamer.end() # Flush streamer buffer
+                if final_text:
+                    yield final_text, None
 
                 # --- Final Timer Pauses ---
-                if prefill_timer_running: # If loop never ran (no tokens)
+                if prefill_timer_running:
                     profiler_orig.pause_timer("prefill")
                     prefill_timer_running = False
-                    # Ensure decode timer exists and has 0 time if it wasn't started
                     if not decode_timer_running:
                         profiler_orig.create_timer("decode")
                         profiler_orig.set_counter("decode", 0)
-                if decode_timer_running: # If decode phase started
+                if decode_timer_running:
                     profiler_orig.pause_timer("decode")
                     decode_timer_running = False
 
-
-                report_last_time_performance(profiler_orig) # Report performance
+                report_last_time_performance(profiler_orig)
 
                 # Determine finish reason
                 decode_count = profiler_orig.get_counter('decode')
-                # Calculate max_new based on available cache space
                 max_new = max(0, self.args.cache_lens - query_length - 1)
-                max_new = min(max_new, self.args.max_new_tokens) # Also respect max_new_tokens limit
-
-                # logger.debug(f"Query {actual_query_id}: Decoded {decode_count} tokens. Max allowed: {max_new}. Query length: {query_length}. Cache: {self.args.cache_lens}")
+                max_new = min(max_new, self.args.max_new_tokens)
                 finish_reason = "length" if decode_count >= max_new else "stop"
-                # logger.info(f"Original request {actual_query_id} finished with reason: {finish_reason}")
                 yield "", finish_reason
 
                 # --- Yield Usage ---
@@ -931,66 +872,49 @@ class BalanceServeInterface(BackendInterfaceBase):
 
             except Exception as e:
                 logger.error(f"Error processing original request for hash {prompt_hash[:8]}: {e}", exc_info=True)
-                # Ensure future is set with exception if it wasn't set with query_id
-                if not query_id_future.done():
-                    query_id_future.set_exception(e)
-                # Clean up token queue if query was added but streaming failed
+                if not query_id_future.done(): query_id_future.set_exception(e)
                 if actual_query_id:
-                    async with self.proxy_lock:
-                        self.query_token_queues.pop(actual_query_id, None)
-                # Attempt to pause any running timers before raising
-                try:
+                    async with self.proxy_lock: self.query_token_queues.pop(actual_query_id, None)
+                try: # Attempt to pause timers on error
                     if prefill_timer_running: profiler_orig.pause_timer("prefill")
                     if decode_timer_running: profiler_orig.pause_timer("decode")
-                except ValueError: pass # Ignore errors if timer wasn't running
-                raise # Re-raise the exception for the caller
+                except ValueError: pass
+                raise
             finally:
-                # Clean up active prefill entry *always*
-                async with self.proxy_lock:
-                    removed_future = self.active_prefills.pop(prompt_hash, None)
-                    # logger.debug(f"Cleaned up active_prefills for hash {prompt_hash[:8]}. Future removed: {removed_future is not None}")
+                async with self.proxy_lock: self.active_prefills.pop(prompt_hash, None)
 
-        else:
-            # --- This request joined an existing prefill ---
+        else: # Joined request
             try:
-                # Wait for the original request to get the query_id
                 query_id_to_use = await query_id_future
                 # logger.info(f"Joined existing prefill for query ID: {query_id_to_use}")
 
-                # Stream results from the shared queue
-                # Removed streamer reset
-                is_first_token = True # For yielding think token
+                streamer = TextStreamer(self.tokenizer) # Use local streamer instance
+                streamer.reset()
+                is_first_token = True
                 async for token_id in self._get_token_stream(query_id_to_use):
                     if is_first_token and Config().user_force_think:
                         yield '<think>\n', None
                         is_first_token = False
 
-                    # --- Direct Decoding and Yielding ---
-                    try:
-                        token_text = self.tokenizer.decode([token_id], skip_special_tokens=True)
-                        if token_text:
-                            yield token_text, None
-                    except Exception as decode_err:
-                        logger.warning(f"Error decoding token ID {token_id} for joined query {query_id_to_use}: {decode_err}")
-                    # -------------------------------------
+                    # --- Use TextStreamer ---
+                    decoded_text = streamer.put(token_id)
+                    if decoded_text:
+                        yield decoded_text, None
+                    # -----------------------
 
-
-                # Removed final streamer flush
-                # final_text = self.streamer.end()
-                # if final_text:
-                #     yield final_text, None
+                final_text = streamer.end() # Flush streamer buffer
+                if final_text:
+                    yield final_text, None
 
                 # logger.info(f"Joined request for query {query_id_to_use} finished streaming.")
-                # Yield default/unknown finish reason and no usage for joined requests
-                yield "", "stop" # Assume stop, as we don't know the original's reason
-                yield None # No usage info
+                yield "", "stop"
+                yield None
 
             except asyncio.CancelledError:
                 logger.info(f"Joined request for hash {prompt_hash[:8]} cancelled.")
-                yield "", "cancelled" # Indicate cancellation if possible
+                yield "", "cancelled"
                 yield None
             except Exception as e:
                 logger.error(f"Error processing joined request for hash {prompt_hash[:8]} (Future exception: {query_id_future.exception()}): {e}", exc_info=True)
-                # Yield minimal info to signal error
-                yield "", "failed" # Indicate failure
+                yield "", "failed"
                 yield None
