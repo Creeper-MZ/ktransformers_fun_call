@@ -279,8 +279,9 @@ class Engine:
         logits = forward_output.logits[0].to(self.device) # Assuming single batch output for now
 
         # Prepare sampling options
-        temperatures = forward_output.temperatures[0].to(self.device) if hasattr(forward_output, "temperatures") and forward_output.temperatures else None
-        top_ps = forward_output.top_ps[0].to(self.device) if hasattr(forward_output, "top_ps") and forward_output.top_ps else None
+        temperatures = forward_output.temperatures[0].to(self.device) if hasattr(forward_output, "temperatures") and forward_output.temperatures is not None else None
+        top_ps = forward_output.top_ps[0].to(self.device) if hasattr(forward_output, "top_ps") and forward_output.top_ps is not None else None
+
 
         # Create SamplingOptions instance
         # Ensure bsz matches logits batch size
@@ -611,51 +612,87 @@ class BalanceServeInterface(BackendInterfaceBase):
         """Tokenizes a raw prompt string, returning a CPU tensor."""
         return self.tokenizer.encode(prompt, return_tensors="pt").cpu()
 
+    # --- UPDATED queue_proxy with batching ---
     async def queue_proxy(self):
-        """Forwards tokens from the main engine queue to specific consumer queues."""
-        logger.info("Queue Proxy Started")
+        """Forwards tokens from the main engine queue to specific consumer queues, using batching."""
+        logger.info("Queue Proxy Started - Batching Enabled")
+        batch_timeout = 0.005 # Max time to wait for more tokens after getting one (very short)
+        max_batch_size = 64  # Max tokens to process in one go
+
         while True:
+            tokens_batch = []
             try:
-                # Use blocking get with a timeout
+                # Try to get the first token with a timeout
                 query_id, token = self.token_queue.get(timeout=0.1)
+                tokens_batch.append((query_id, token))
 
-                async with self.proxy_lock:
-                    if query_id in self.query_token_queues:
-                        # logger.debug(f"Proxy: Got token {token} for query {query_id}. Distributing to {len(self.query_token_queues[query_id])} queues.")
-                        queues_to_remove = []
-                        for i, q in enumerate(self.query_token_queues[query_id]):
-                            try:
-                                q.put_nowait(token)
-                            except asyncio.QueueFull:
-                                logger.warning(f"Proxy: Consumer queue {i} full for query {query_id}. Token might be dropped.")
-                            except Exception as e: # Catch potential errors during put_nowait
-                                logger.error(f"Proxy: Error putting token to consumer queue {i} for query {query_id}: {e}")
-                                # Optionally mark queue for removal if it causes persistent errors
-                                # queues_to_remove.append(q)
-
-
-                        # Remove queues that caused errors (optional)
-                        # for q_rem in queues_to_remove:
-                        #    try:
-                        #        self.query_token_queues[query_id].remove(q_rem)
-                        #    except ValueError: pass # Already removed
-
-                        if token is None: # End signal
-                            # logger.debug(f"Proxy: End signal received for query {query_id}. Cleaning up.")
-                            # Clear the list associated with the query_id
-                            self.query_token_queues.pop(query_id, None)
-                    # else:
-                    # logger.debug(f"Proxy: Received token for inactive/unknown query {query_id}. Discarding.")
+                # Try to get more tokens without waiting long (gather available tokens quickly)
+                start_time = time.time()
+                while len(tokens_batch) < max_batch_size and (time.time() - start_time) < batch_timeout:
+                    try:
+                        query_id_more, token_more = self.token_queue.get_nowait()
+                        tokens_batch.append((query_id_more, token_more))
+                    except queue.Empty:
+                        break # No more tokens immediately available
 
             except queue.Empty:
-                await asyncio.sleep(0.01) # Yield control when queue is empty
+                # No tokens received during the initial timeout
+                await asyncio.sleep(0.02) # Sleep slightly longer if queue consistently empty
+                continue # Skip processing and try getting again
             except Exception as e:
                 # Catch potential exceptions if the queue is closed during shutdown
                 if isinstance(e, (EOFError, BrokenPipeError)):
                     logger.warning(f"Queue proxy encountered EOF/BrokenPipe, likely during shutdown: {e}")
                     break # Exit loop on shutdown signal
-                logger.error(f"Error in queue_proxy: {e}", exc_info=True)
+                logger.error(f"Error getting tokens in queue_proxy: {e}", exc_info=True)
                 await asyncio.sleep(1) # Avoid rapid error loops
+                continue
+
+            # Process the collected batch
+            if tokens_batch:
+                # Group tokens by query_id for efficient distribution
+                grouped_tokens = defaultdict(list)
+                query_ids_with_end_signal = set()
+                for qid, tkn in tokens_batch:
+                    grouped_tokens[qid].append(tkn)
+                    if tkn is None:
+                        query_ids_with_end_signal.add(qid)
+
+                # Distribute tokens under lock
+                async with self.proxy_lock:
+                    for query_id, tokens in grouped_tokens.items():
+                        if query_id in self.query_token_queues:
+                            # logger.debug(f"Proxy: Distributing batch of {len(tokens)} tokens for query {query_id}.")
+                            # Distribute actual tokens first
+                            valid_tokens = [t for t in tokens if t is not None]
+                            if valid_tokens:
+                                # Get list of consumer queues for this query_id *once*
+                                consumer_queues = self.query_token_queues[query_id][:] # Create copy
+                                for q in consumer_queues:
+                                    for t in valid_tokens: # Put tokens individually
+                                        try:
+                                            q.put_nowait(t)
+                                        except asyncio.QueueFull:
+                                            logger.warning(f"Proxy: Consumer queue full for query {query_id}. Token {t} might be dropped.")
+                                        except Exception as e:
+                                            logger.error(f"Proxy: Error putting token {t} to consumer queue for query {query_id}: {e}")
+
+                            # Handle end signal if present in the batch for this query_id
+                            if query_id in query_ids_with_end_signal:
+                                # logger.debug(f"Proxy: End signal in batch for query {query_id}. Cleaning up.")
+                                consumer_queues_end = self.query_token_queues.get(query_id, [])[:] # Use .get and copy
+                                for q in consumer_queues_end:
+                                    try:
+                                        q.put_nowait(None) # Send end signal to consumers
+                                    except Exception as e:
+                                        logger.error(f"Proxy: Error putting None to consumer queue for query {query_id}: {e}")
+                                # Remove the entry after signaling all consumers
+                                self.query_token_queues.pop(query_id, None)
+                        # else:
+                        # logger.debug(f"Proxy: Received tokens for inactive/unknown query {query_id}. Discarding batch.")
+
+            # Minimal sleep to prevent busy-waiting if batches are constantly processed
+            # await asyncio.sleep(0.001) # Can potentially remove this if get(timeout=0.1) provides enough yielding
 
     @asynccontextmanager
     async def lifespan(self, app: FastAPI):
