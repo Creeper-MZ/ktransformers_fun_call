@@ -221,12 +221,16 @@ class Engine:
         gguf_path = args.gguf_path
         if gguf_path is None and optimize_config_path:
             # Only prompt if optimization rules exist, otherwise loading might fail
-            gguf_path = input(
-                "Please input the path of your GGUF file (required for optimization): "
-            )
-            if not gguf_path:
-                logger.error("GGUF path is required for optimization but not provided.")
-                raise ValueError("GGUF path needed for optimization.")
+            # Avoid using input() in server code - get path from config or args
+            logger.error("GGUF path is required for optimization but not provided in config/args.")
+            raise ValueError("GGUF path needed for optimization, please provide via config or --gguf_path argument.")
+            # gguf_path = input(
+            #     "Please input the path of your GGUF file (required for optimization): "
+            # )
+            # if not gguf_path:
+            #      logger.error("GGUF path is required for optimization but not provided.")
+            #      raise ValueError("GGUF path needed for optimization.")
+
 
         # Optimize and load weights if paths are valid
         if optimize_config_path and gguf_path:
@@ -406,16 +410,24 @@ def run_engine(args, token_queue, broadcast_endpoint, start_event):
     try:
         logger.info("Engine process starting...")
         engine = Engine(args, token_queue, broadcast_endpoint)
+        logger.info("Engine initialized.") # Log after engine init
+
+        # *** MOVED start_event.set() HERE ***
+        start_event.set() # Signal that basic initialization is complete
+        logger.info("Start event set. Proceeding with warmup (if enabled).")
+
         if args.use_cuda_graph:
             logger.info("Warming up CUDA graph...")
             engine.model_runner.warmup()
             logger.info("CUDA graph warmup complete.")
-        start_event.set() # Signal that initialization is complete
+
+        # Start the main loop *after* potential warmup
         engine.loop()
+
     except Exception as e:
         logger.critical(f"Engine process failed: {e}", exc_info=True)
-        start_event.set() # Signal completion even on error to unblock main process
-        # Consider more robust error handling/reporting here
+        if not start_event.is_set(): # Ensure event is set even on error
+            start_event.set()
         raise # Re-raise exception to make the process exit non-zero
 
 
@@ -441,8 +453,16 @@ class BalanceServeInterface(BackendInterfaceBase):
         processes = []
         # Create a temporary file for IPC endpoint, ensure it's cleaned up
         try:
-            with tempfile.NamedTemporaryFile(delete=False) as tmp_f:
-                self.broadcast_endpoint = tmp_f.name
+            # Use a more robust temporary file creation if needed
+            tmp_dir = tempfile.gettempdir()
+            safe_pid = os.getpid()
+            # Ensure the endpoint name is unique and relatively short for IPC paths
+            ipc_filename = f"ktransformers_ipc_{safe_pid}_{int(time.time())}"
+            self.broadcast_endpoint = os.path.join(tmp_dir, ipc_filename)
+            # Create the file descriptor without deleting it immediately
+            # This ensures the path exists for binding but doesn't leave an open file handle
+            fd = os.open(self.broadcast_endpoint, os.O_CREAT | os.O_EXCL | os.O_RDWR)
+            os.close(fd)
             logger.info(f"Using temporary IPC endpoint: {self.broadcast_endpoint}")
         except Exception as e:
             logger.error(f"Failed to create temporary file for IPC: {e}", exc_info=True)
@@ -465,30 +485,49 @@ class BalanceServeInterface(BackendInterfaceBase):
 
         # --- Start Engine Process ---
         start_event = ctx.Event()
-        p = ctx.Process(target=run_engine, args=(self.args, self.token_queue, self.broadcast_endpoint, start_event))
+        p = ctx.Process(target=run_engine, args=(self.args, self.token_queue, self.broadcast_endpoint, start_event), daemon=True) # Set daemon=True
         p.start()
         processes.append(p)
-        logger.info("Waiting for engine process to initialize...")
-        start_event.wait(timeout=60.0) # Add timeout
-        if not start_event.is_set():
-            logger.error("Engine process initialization timed out.")
+        logger.info("Waiting for engine process to signal initialization...")
+        # Increased timeout significantly
+        initialized = start_event.wait(timeout=300.0) # Wait up to 5 minutes
+
+        if not initialized:
+            logger.error("Engine process initialization timed out (300s).")
             if p.is_alive():
+                logger.warning("Terminating potentially stuck engine process...")
                 p.terminate() # Terminate if stuck
+                p.join(timeout=5.0) # Wait briefly
+                if p.is_alive():
+                    p.kill() # Force kill if terminate fails
+            # Clean up temporary file if process failed/timed out
+            self._cleanup_ipc_file()
             raise TimeoutError("Engine process failed to initialize within timeout.")
 
-        # Check if process started correctly
+
+        # Check if process started correctly *after* waiting for the event
         if not p.is_alive():
-            logger.error("Engine process failed to start or terminated prematurely.")
-            # Clean up temporary file if process failed
-            if self.broadcast_endpoint and os.path.exists(self.broadcast_endpoint) and self.broadcast_endpoint.startswith(tempfile.gettempdir()):
+            logger.error("Engine process failed to start or terminated prematurely after signaling event (or event was never set).")
+            self._cleanup_ipc_file()
+            raise RuntimeError("Engine process failed to start or stay running.")
+
+        logger.info("Engine process signaled initialization successfully.")
+        self._engine_process = p # Store process handle for potential cleanup
+
+
+    def _cleanup_ipc_file(self):
+        """Helper to clean up the IPC file."""
+        if hasattr(self, 'broadcast_endpoint') and self.broadcast_endpoint and os.path.exists(self.broadcast_endpoint):
+            # Add check to ensure it's likely our file before deleting
+            if self.broadcast_endpoint.startswith(tempfile.gettempdir()) or "/tmp/" in self.broadcast_endpoint:
                 try:
                     os.unlink(self.broadcast_endpoint)
                     logger.info(f"Cleaned up temporary IPC file: {self.broadcast_endpoint}")
                 except OSError as unlink_e:
                     logger.error(f"Error cleaning up IPC file {self.broadcast_endpoint}: {unlink_e}")
-            raise RuntimeError("Engine process failed to start.")
-        logger.info("Engine process started successfully.")
-        self._engine_process = p # Store process handle for potential cleanup
+            else:
+                logger.warning(f"Skipping cleanup of IPC file outside temp dir: {self.broadcast_endpoint}")
+
 
     def __del__(self):
         # Cleanup resources on object deletion
@@ -510,14 +549,11 @@ class BalanceServeInterface(BackendInterfaceBase):
             if self._engine_process.is_alive():
                 logger.warning("Engine process did not terminate gracefully, killing.")
                 self._engine_process.kill()
+            logger.info("Engine process terminated.")
+
 
         # Clean up temporary IPC file
-        if hasattr(self, 'broadcast_endpoint') and self.broadcast_endpoint and os.path.exists(self.broadcast_endpoint) and self.broadcast_endpoint.startswith(tempfile.gettempdir()):
-            try:
-                os.unlink(self.broadcast_endpoint)
-                logger.info(f"Cleaned up temporary IPC file: {self.broadcast_endpoint}")
-            except OSError as e:
-                logger.error(f"Error cleaning up IPC file {self.broadcast_endpoint}: {e}")
+        self._cleanup_ipc_file()
 
 
     def format_and_tokenize_input_ids(self, thread_id: ObjectID, messages: List) -> torch.Tensor:
