@@ -313,7 +313,18 @@ class BalanceServeInterface(BackendInterfaceBase):
     def tokenize_prompt(self, prompt: str):
         input_ids = self.tokenizer.encode(prompt, return_tensors="pt").to(self.args.device)
         return input_ids
-
+    def check_is_new(self, thread_id: str):
+        if not self.use_static_cache:
+            return True
+        if self.last_request_id is None:
+            self.last_request_id = thread_id
+            return True
+        else:
+            if self.last_request_id == thread_id:
+                return False
+            else:
+                self.last_request_id = thread_id
+                return True
     def format_and_tokenize_input_ids(self, thread_id: ObjectID, messages: List):
         for m in messages:
             if m["role"] == "system":
@@ -332,6 +343,7 @@ class BalanceServeInterface(BackendInterfaceBase):
         if input_str.endswith('<think>\n'):
             input_str = input_str[:-len('<think>\n')]
         input_ids = self.tokenizer.encode(input_str, return_tensors="pt").to(self.args.device)
+        print(self.last_request_id, thread_id)
         if (self.last_request_id is not None) and self.last_request_id == thread_id:
             x = self.generated_ids[:,:self.seq_length]
             y = input_ids[:,:self.seq_length]
@@ -406,6 +418,11 @@ class BalanceServeInterface(BackendInterfaceBase):
             else:
                 profiler.inc("decode")
             yield token, None
+        for t in self.prefill(input_ids, self.check_is_new(thread_id), temperature, top_p):
+            # output think token after prefill done
+            if t is not None:
+                print(t, end="",flush=True)
+                yield t, None
         profiler.pause_timer("decode")
         report_last_time_performance(profiler)
         yield self.streamer.end(), None
