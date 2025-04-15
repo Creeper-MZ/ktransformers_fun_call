@@ -836,12 +836,19 @@ class BalanceServeInterface(BackendInterfaceBase):
 
                 # Pause decode timer after loop finishes
                 # Handle case where no tokens were generated (decode timer never started)
-                if not is_first_token_yielded and profiler_orig.timers.get('decode') is None:
+                if not is_first_token_yielded:
                     # If prefill finished but no decode tokens arrived (e.g., immediate stop)
-                    profiler_orig.pause_timer("prefill") # Ensure prefill timer is stopped
-                    profiler_orig.create_timer("decode") # Create decode timer
-                    profiler_orig.set_counter("decode", 0) # Set count to 0
-                profiler_orig.pause_timer("decode") # Pause decode timer
+                    # Ensure prefill timer is stopped if it was running
+                    if profiler_orig.timers.get('prefill', {}).get('running', False):
+                        profiler_orig.pause_timer("prefill")
+                    # Create decode timer if it doesn't exist
+                    if 'decode' not in profiler_orig.timers:
+                        profiler_orig.create_timer("decode")
+                    # Ensure decode count is 0
+                    profiler_orig.set_counter("decode", 0)
+                # Ensure decode timer is stopped if it exists and was running
+                if profiler_orig.timers.get('decode', {}).get('running', False):
+                    profiler_orig.pause_timer("decode") # Pause decode timer
 
                 report_last_time_performance(profiler_orig) # Report performance
 
