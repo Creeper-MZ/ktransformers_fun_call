@@ -17,7 +17,7 @@ import torch
 from ktransformers.server.backend.interfaces.transformers import (
     ConfigArgs,
     default_args,
-    TextStreamer,
+    TextStreamer, # Keep import if streamer is used elsewhere, but removed from core loop
 )
 from ktransformers.server.schemas.base import ObjectID
 from ktransformers.server.config.log import logger
@@ -58,17 +58,22 @@ default_optimize_rules = {
 # Helper function to yield tokens from an asyncio queue
 async def chat_stream(queue: asyncio.Queue, tokenizer: AutoTokenizer):
     """Asynchronously yields decoded text from tokens received via a queue."""
-    streamer = TextStreamer(tokenizer)
+    # This helper might need adjustment if TextStreamer is fully removed,
+    # but it's not directly used by the core inference loop anymore.
+    # Keeping it simple for now.
     while True:
         token = await queue.get()
         if token is None: # End signal
-            s = streamer.end()
-            if s:
-                yield s
             break
-        decoded_text = streamer.put(token)
-        if decoded_text:
-            yield decoded_text # Yield only non-empty strings
+        try:
+            # Attempt to decode single token ID
+            # Note: This might have issues with multi-token characters
+            decoded_text = tokenizer.decode([token], skip_special_tokens=True)
+            if decoded_text:
+                yield decoded_text
+        except Exception as e:
+            logger.warning(f"Error decoding token {token} in chat_stream helper: {e}")
+
 
 # Helper function to update query states after generation
 def fill_generated_tokens(query_updates: list[sched_ext.QueryUpdate], generated_tokens: torch.Tensor, query_manager: QueryManager = None):
@@ -442,7 +447,7 @@ class BalanceServeInterface(BackendInterfaceBase):
     args: ConfigArgs
     tokenizer: AutoTokenizer
     sched_client: SchedulerClient
-    streamer: TextStreamer
+    # streamer: TextStreamer # Removed streamer instance variable
     token_queue: Queue # MP Queue from Engine
     active_prefills: Dict[str, asyncio.Future] # Hash -> Future[query_id]
     query_token_queues: Dict[str, List[asyncio.Queue]] # query_id -> List[consumer_queues]
@@ -477,7 +482,7 @@ class BalanceServeInterface(BackendInterfaceBase):
         self.token_queue = ctx.Queue(maxsize=10000) # Increased queue size
         self.tokenizer = AutoTokenizer.from_pretrained(args.model_dir, trust_remote_code=args.trust_remote_code)
         self.sched_client = SchedulerClient(args.sched_port)
-        self.streamer = TextStreamer(self.tokenizer)
+        # self.streamer = TextStreamer(self.tokenizer) # Removed streamer initialization
 
         # --- Attributes for prefill caching ---
         self.active_prefills = {}
@@ -848,7 +853,8 @@ class BalanceServeInterface(BackendInterfaceBase):
                 if Config().user_force_think:
                     yield '<think>\n', None # Yield think token immediately
 
-                self.streamer.reset()
+                # Removed streamer reset as it's not used in the loop
+                # self.streamer.reset()
                 token_count = 0
                 prefill_finished = False # Track if prefill timer was paused
 
@@ -865,10 +871,15 @@ class BalanceServeInterface(BackendInterfaceBase):
                             profiler_orig.set_counter("decode", 0)
                         prefill_finished = True
 
-                    # Decode and yield text
-                    decoded_text = self.streamer.put(token_id)
-                    if decoded_text:
-                        yield decoded_text, None
+                    # --- Direct Decoding and Yielding ---
+                    try:
+                        # Decode single token ID. Handle potential errors.
+                        token_text = self.tokenizer.decode([token_id], skip_special_tokens=True)
+                        if token_text: # Yield if decoding produces text
+                            yield token_text, None
+                    except Exception as decode_err:
+                        logger.warning(f"Error decoding token ID {token_id} for query {actual_query_id}: {decode_err}")
+                    # -------------------------------------
 
                     # Increment decode counter *after* the first token arrives
                     if prefill_finished:
@@ -877,9 +888,10 @@ class BalanceServeInterface(BackendInterfaceBase):
 
 
                 # --- Handle Final Token & Finish Reason ---
-                final_text = self.streamer.end()
-                if final_text:
-                    yield final_text, None
+                # Removed final streamer flush as streamer is not used in loop
+                # final_text = self.streamer.end()
+                # if final_text:
+                #     yield final_text, None
 
                 # --- Final Timer Pauses ---
                 if prefill_timer_running: # If loop never ran (no tokens)
@@ -946,20 +958,27 @@ class BalanceServeInterface(BackendInterfaceBase):
                 # logger.info(f"Joined existing prefill for query ID: {query_id_to_use}")
 
                 # Stream results from the shared queue
-                self.streamer.reset()
+                # Removed streamer reset
                 is_first_token = True # For yielding think token
                 async for token_id in self._get_token_stream(query_id_to_use):
                     if is_first_token and Config().user_force_think:
                         yield '<think>\n', None
                         is_first_token = False
 
-                    decoded_text = self.streamer.put(token_id)
-                    if decoded_text:
-                        yield decoded_text, None
+                    # --- Direct Decoding and Yielding ---
+                    try:
+                        token_text = self.tokenizer.decode([token_id], skip_special_tokens=True)
+                        if token_text:
+                            yield token_text, None
+                    except Exception as decode_err:
+                        logger.warning(f"Error decoding token ID {token_id} for joined query {query_id_to_use}: {decode_err}")
+                    # -------------------------------------
 
-                final_text = self.streamer.end()
-                if final_text:
-                    yield final_text, None
+
+                # Removed final streamer flush
+                # final_text = self.streamer.end()
+                # if final_text:
+                #     yield final_text, None
 
                 # logger.info(f"Joined request for query {query_id_to_use} finished streaming.")
                 # Yield default/unknown finish reason and no usage for joined requests
