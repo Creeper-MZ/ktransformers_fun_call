@@ -1,5 +1,6 @@
 # Import necessary libraries
-from typing import Any, AsyncIterable, List, Optional, Set, Dict
+# Corrected: Added Tuple to imports
+from typing import Any, AsyncIterable, List, Optional, Set, Dict, Tuple
 from ktransformers.models.custom_cache import KDeepSeekV3Cache # Assuming this exists and is relevant
 from transformers import (
     AutoTokenizer,
@@ -266,6 +267,7 @@ class Engine:
         self.query_manager = QueryManager(device = self.device, page_size = args.page_size)
 
 
+    # Corrected: Added Tuple type hint import
     def sampling(self, forward_output: ForwardBatchOutput) -> Tuple[torch.Tensor, torch.Tensor]:
         """Performs sampling on the model output logits."""
         # Ensure logits are on the correct device
@@ -333,7 +335,7 @@ class Engine:
                     next_batch = None
 
                 # 4. Broadcast the next batch (optional)
-                if self.pub_socket and not self.pub_socket.closed:
+                if hasattr(self, 'pub_socket') and self.pub_socket and not self.pub_socket.closed:
                     try:
                         # logger.debug("Broadcasting next batch.")
                         self.pub_socket.send_pyobj(next_batch)
@@ -437,7 +439,18 @@ class BalanceServeInterface(BackendInterfaceBase):
         self.args = args
         self.thread_map = {} # Maps thread_id to query_id
         processes = []
-        self.broadcast_endpoint = tempfile.NamedTemporaryFile(delete=False).name
+        # Create a temporary file for IPC endpoint, ensure it's cleaned up
+        try:
+            with tempfile.NamedTemporaryFile(delete=False) as tmp_f:
+                self.broadcast_endpoint = tmp_f.name
+            logger.info(f"Using temporary IPC endpoint: {self.broadcast_endpoint}")
+        except Exception as e:
+            logger.error(f"Failed to create temporary file for IPC: {e}", exc_info=True)
+            # Fallback or raise error
+            self.broadcast_endpoint = f"/tmp/ktransformers_ipc_{os.getpid()}" # Example fallback
+            logger.warning(f"Falling back to IPC endpoint: {self.broadcast_endpoint}")
+
+
         ctx = mp.get_context("spawn")
         self.token_queue = ctx.Queue(maxsize=10000) # Increased queue size
         self.tokenizer = AutoTokenizer.from_pretrained(args.model_dir, trust_remote_code=args.trust_remote_code)
@@ -456,13 +469,55 @@ class BalanceServeInterface(BackendInterfaceBase):
         p.start()
         processes.append(p)
         logger.info("Waiting for engine process to initialize...")
-        start_event.wait() # Wait for engine to signal readiness
-        # Check if process started correctly (optional)
+        start_event.wait(timeout=60.0) # Add timeout
+        if not start_event.is_set():
+            logger.error("Engine process initialization timed out.")
+            if p.is_alive():
+                p.terminate() # Terminate if stuck
+            raise TimeoutError("Engine process failed to initialize within timeout.")
+
+        # Check if process started correctly
         if not p.is_alive():
             logger.error("Engine process failed to start or terminated prematurely.")
-            # Handle error appropriately, maybe raise exception
+            # Clean up temporary file if process failed
+            if self.broadcast_endpoint and os.path.exists(self.broadcast_endpoint) and self.broadcast_endpoint.startswith(tempfile.gettempdir()):
+                try:
+                    os.unlink(self.broadcast_endpoint)
+                    logger.info(f"Cleaned up temporary IPC file: {self.broadcast_endpoint}")
+                except OSError as unlink_e:
+                    logger.error(f"Error cleaning up IPC file {self.broadcast_endpoint}: {unlink_e}")
             raise RuntimeError("Engine process failed to start.")
         logger.info("Engine process started successfully.")
+        self._engine_process = p # Store process handle for potential cleanup
+
+    def __del__(self):
+        # Cleanup resources on object deletion
+        logger.info("BalanceServeInterface shutting down...")
+        # Close scheduler client connection
+        if hasattr(self, 'sched_client') and self.sched_client:
+            # Assuming SchedulerClient has a close method or similar
+            try:
+                # self.sched_client.close() # Add a close method if needed
+                pass
+            except Exception as e:
+                logger.error(f"Error closing scheduler client: {e}")
+
+        # Terminate engine process if still alive
+        if hasattr(self, '_engine_process') and self._engine_process and self._engine_process.is_alive():
+            logger.info("Terminating engine process...")
+            self._engine_process.terminate()
+            self._engine_process.join(timeout=5.0) # Wait briefly for termination
+            if self._engine_process.is_alive():
+                logger.warning("Engine process did not terminate gracefully, killing.")
+                self._engine_process.kill()
+
+        # Clean up temporary IPC file
+        if hasattr(self, 'broadcast_endpoint') and self.broadcast_endpoint and os.path.exists(self.broadcast_endpoint) and self.broadcast_endpoint.startswith(tempfile.gettempdir()):
+            try:
+                os.unlink(self.broadcast_endpoint)
+                logger.info(f"Cleaned up temporary IPC file: {self.broadcast_endpoint}")
+            except OSError as e:
+                logger.error(f"Error cleaning up IPC file {self.broadcast_endpoint}: {e}")
 
 
     def format_and_tokenize_input_ids(self, thread_id: ObjectID, messages: List) -> torch.Tensor:
@@ -558,6 +613,10 @@ class BalanceServeInterface(BackendInterfaceBase):
             except queue.Empty:
                 await asyncio.sleep(0.01) # Yield control when queue is empty
             except Exception as e:
+                # Catch potential exceptions if the queue is closed during shutdown
+                if isinstance(e, (EOFError, BrokenPipeError)):
+                    logger.warning(f"Queue proxy encountered EOF/BrokenPipe, likely during shutdown: {e}")
+                    break # Exit loop on shutdown signal
                 logger.error(f"Error in queue_proxy: {e}", exc_info=True)
                 await asyncio.sleep(1) # Avoid rapid error loops
 
