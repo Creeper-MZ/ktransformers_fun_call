@@ -332,6 +332,16 @@ class BalanceServeInterface(BackendInterfaceBase):
         if input_str.endswith('<think>\n'):
             input_str = input_str[:-len('<think>\n')]
         input_ids = self.tokenizer.encode(input_str, return_tensors="pt").to(self.args.device)
+        if (self.last_request_id is not None) and self.last_request_id == thread_id:
+            x = self.generated_ids[:,:self.seq_length]
+            y = input_ids[:,:self.seq_length]
+            # We can only hope that the input_ids are the same
+            unequal_mask = torch.ne(x,y)
+            unequal_positions = torch.nonzero(unequal_mask)
+            num_unequal_elements = unequal_mask.sum().item()
+            logger.warning(f'num_unequal_elements: {num_unequal_elements}') 
+
+            input_ids = input_ids[:,self.seq_length:]
         logger.debug(f"get input ids of shape {input_ids.shape}")
         return input_ids
 
