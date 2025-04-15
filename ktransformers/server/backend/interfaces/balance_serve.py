@@ -93,6 +93,7 @@ def fill_generated_tokens(query_updates: list[sched_ext.QueryUpdate], generated_
 def report_last_time_performance(profiler: Profiler):
     """Logs performance metrics from the Profiler."""
     try:
+        # Use get_timer_sec which handles non-existent timers gracefully (returns 0)
         tokenize_time = profiler.get_timer_sec('tokenize')
         prefill_time = profiler.get_timer_sec('prefill')
         decode_time = profiler.get_timer_sec('decode')
@@ -735,6 +736,8 @@ class BalanceServeInterface(BackendInterfaceBase):
             # --- This is the first request for this prompt hash ---
             profiler_orig = Profiler() # Profiler for the original request
             actual_query_id = None # Initialize to None
+            prefill_timer_running = False
+            decode_timer_running = False
             try:
                 # --- Tokenize ---
                 profiler_orig.create_and_start_timer("tokenize")
@@ -757,7 +760,6 @@ class BalanceServeInterface(BackendInterfaceBase):
                     input_ids = torch.cat([input_ids, token_thinks], dim=1)
 
                 profiler_orig.pause_timer("tokenize")
-                profiler_orig.create_and_start_timer("prefill")
 
                 # --- Prepare QueryAdd ---
                 query_add = sched_ext.QueryAdd()
@@ -791,6 +793,10 @@ class BalanceServeInterface(BackendInterfaceBase):
                     if query_length >= self.args.cache_lens:
                         raise ValueError(f"Query length ({query_length}) exceeds cache length ({self.args.cache_lens}).")
 
+                # --- Start Prefill Timer ---
+                profiler_orig.create_and_start_timer("prefill")
+                prefill_timer_running = True
+
 
                 # --- Add Query to Scheduler ---
                 actual_query_id = self.sched_client.add_query(query_add)
@@ -807,24 +813,28 @@ class BalanceServeInterface(BackendInterfaceBase):
 
                 self.streamer.reset()
                 token_count = 0
-                is_first_token_yielded = False # Track if the first *decoded* token was yielded
+                prefill_finished = False # Track if prefill timer was paused
+
                 async for token_id in self._get_token_stream(actual_query_id):
                     # Prefill ends when the first token arrives from the engine
-                    if not is_first_token_yielded:
-                        profiler_orig.pause_timer("prefill")
-                        profiler_orig.create_and_start_timer("decode")
-                        profiler_orig.set_counter("decode", 0)
+                    if not prefill_finished:
+                        if prefill_timer_running:
+                            profiler_orig.pause_timer("prefill")
+                            prefill_timer_running = False
+                        # Start decode timer only once
+                        if not decode_timer_running:
+                            profiler_orig.create_and_start_timer("decode")
+                            decode_timer_running = True
+                            profiler_orig.set_counter("decode", 0)
+                        prefill_finished = True
 
                     # Decode and yield text
                     decoded_text = self.streamer.put(token_id)
                     if decoded_text:
                         yield decoded_text, None
-                        is_first_token_yielded = True # Mark first yield
 
                     # Increment decode counter *after* the first token arrives
-                    if not is_first_token_yielded:
-                        pass # Still in prefill phase according to profiler
-                    else:
+                    if prefill_finished:
                         profiler_orig.inc("decode")
                     token_count += 1
 
@@ -834,21 +844,18 @@ class BalanceServeInterface(BackendInterfaceBase):
                 if final_text:
                     yield final_text, None
 
-                # Pause decode timer after loop finishes
-                # Handle case where no tokens were generated (decode timer never started)
-                if not is_first_token_yielded:
-                    # If prefill finished but no decode tokens arrived (e.g., immediate stop)
-                    # Ensure prefill timer is stopped if it was running
-                    if profiler_orig.timers.get('prefill', {}).get('running', False):
-                        profiler_orig.pause_timer("prefill")
-                    # Create decode timer if it doesn't exist
-                    if 'decode' not in profiler_orig.timers:
+                # --- Final Timer Pauses ---
+                if prefill_timer_running: # If loop never ran (no tokens)
+                    profiler_orig.pause_timer("prefill")
+                    prefill_timer_running = False
+                    # Ensure decode timer exists and has 0 time if it wasn't started
+                    if not decode_timer_running:
                         profiler_orig.create_timer("decode")
-                    # Ensure decode count is 0
-                    profiler_orig.set_counter("decode", 0)
-                # Ensure decode timer is stopped if it exists and was running
-                if profiler_orig.timers.get('decode', {}).get('running', False):
-                    profiler_orig.pause_timer("decode") # Pause decode timer
+                        profiler_orig.set_counter("decode", 0)
+                if decode_timer_running: # If decode phase started
+                    profiler_orig.pause_timer("decode")
+                    decode_timer_running = False
+
 
                 report_last_time_performance(profiler_orig) # Report performance
 
@@ -882,6 +889,11 @@ class BalanceServeInterface(BackendInterfaceBase):
                 if actual_query_id:
                     async with self.proxy_lock:
                         self.query_token_queues.pop(actual_query_id, None)
+                # Attempt to pause any running timers before raising
+                try:
+                    if prefill_timer_running: profiler_orig.pause_timer("prefill")
+                    if decode_timer_running: profiler_orig.pause_timer("decode")
+                except ValueError: pass # Ignore errors if timer wasn't running
                 raise # Re-raise the exception for the caller
             finally:
                 # Clean up active prefill entry *always*
