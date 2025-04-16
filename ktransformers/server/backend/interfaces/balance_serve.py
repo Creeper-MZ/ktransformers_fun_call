@@ -364,6 +364,10 @@ class BalanceServeInterface(BackendInterfaceBase):
         This method handles the prefill phase of token generation, with support for caching
         to improve performance for continuing conversations.
         """
+        # Ensure input is on the correct device
+        if input_ids.device != self.device:
+            input_ids = input_ids.to(self.device)
+
         # Track for profiling
         self.profiler.set_counter("prefill", input_ids.shape[-1])
 
@@ -380,11 +384,6 @@ class BalanceServeInterface(BackendInterfaceBase):
             # Reset cache state
             self.seq_length = input_ids.shape[-1]
             self.generated_ids[:, :self.seq_length] = input_ids
-
-            # For new conversations, send entire prompt to scheduler
-            query_add = sched_ext.QueryAdd()
-            query_add.query_token = input_ids[0].tolist()
-            query_add.query_length = input_ids.shape[-1]
         else:
             # Continuing conversation - only process new tokens
             prev_length = self.seq_length
@@ -395,23 +394,18 @@ class BalanceServeInterface(BackendInterfaceBase):
                 # Store new tokens in our cache
                 self.generated_ids[:, prev_length:prev_length+new_length] = new_tokens
                 self.seq_length += new_length
-
-                # For continuing conversations, send context information
-                query_add = sched_ext.QueryAdd()
-                query_add.query_token = new_tokens[0].tolist()
-                query_add.query_length = new_length
-
-                # Important: inform scheduler this is a continuation
-                # with proper context pointer to reuse KV cache
-                context_tokens = self.generated_ids[0, :prev_length].tolist()
-                query_add.context = context_tokens
             else:
                 # No new tokens, nothing to do
                 yield None
                 return
 
-        # Configure common query parameters
+        # Create query - always send full sequence and let scheduler handle deduplication
+        query_add = sched_ext.QueryAdd()
+        query_add.query_token = self.generated_ids[0, :self.seq_length].tolist()
+        query_add.query_length = self.seq_length
         query_add.estimated_length = min(self.args.cache_lens, self.seq_length + self.args.max_new_tokens)
+
+        # Configure stop criteria and sampling parameters
         query_add.stop_criteria = [
             self.tokenizer.encode(self.tokenizer.eos_token, add_special_tokens=False),
             self.tokenizer.encode("<|im_end|>", add_special_tokens=False)
