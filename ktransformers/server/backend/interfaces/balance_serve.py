@@ -375,7 +375,7 @@ class BalanceServeInterface(BackendInterfaceBase):
             if not hasattr(self, 'generated_ids') or self.generated_ids is None:
                 self.generated_ids = torch.zeros(
                     (1, input_ids.shape[-1] + self.args.max_new_tokens),
-                    dtype=torch.int32, device=self.device
+                    dtype=torch.int32, device=self.args.device
                 )
                 self.seq_length = 0
 
