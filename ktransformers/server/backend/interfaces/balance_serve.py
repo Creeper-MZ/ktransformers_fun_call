@@ -364,9 +364,7 @@ class BalanceServeInterface(BackendInterfaceBase):
         This method handles the prefill phase of token generation, with support for caching
         to improve performance for continuing conversations.
         """
-        # Ensure input is on the correct device
-        if input_ids.device != self.device:
-            input_ids = input_ids.to(self.device)
+
 
         # Track for profiling
         self.profiler.set_counter("prefill", input_ids.shape[-1])
