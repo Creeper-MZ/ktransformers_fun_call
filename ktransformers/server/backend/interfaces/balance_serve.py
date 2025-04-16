@@ -358,7 +358,7 @@ class BalanceServeInterface(BackendInterfaceBase):
         return input_ids
 
     @torch.no_grad
-    def prefill(self, input_ids: torch.Tensor, is_new: bool, temperature: Optional[float] = None, top_p: Optional[float] = None):
+    def prefill(self, thread_id: str,input_ids: torch.Tensor, is_new: bool, temperature: Optional[float] = None, top_p: Optional[float] = None):
         """Cache-aware prefill method for BalanceServe architecture.
 
         This method handles the prefill phase of token generation, with support for caching
@@ -489,7 +489,7 @@ class BalanceServeInterface(BackendInterfaceBase):
             else:
                 profiler.inc("decode")
             yield token, None
-        for t in self.prefill(input_ids, self.check_is_new(thread_id), temperature, top_p):
+        for t in self.prefill(thread_id,input_ids, self.check_is_new(thread_id), temperature, top_p):
             # output think token after prefill done
             if t is not None:
                 print(t, end="",flush=True)
