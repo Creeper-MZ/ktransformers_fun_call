@@ -123,10 +123,10 @@ def get_tool_instructions():
     """Return concise tool calling instructions in English"""
     return """When you need real-time information or specialized operations, use function calls with this format:
 
-<｜tool_calls_begin｜><｜tool_call_begin｜>function<｜tool_sep｜>function_name
+<tools▁begin><tool▁begin>function<tool▁sep>function_name
 ```json
 {"param1": "value1", "param2": "value2"}
-```<｜tool_call_end｜><｜tool_calls_end｜>
+```<tool▁end><tools▁end>
 
 Use functions when needed. Ensure proper JSON formatting with appropriate parameters."""
 
@@ -194,11 +194,11 @@ async def chat_completion(request: Request, create: ChatCompletionCreate):
             tool_call_end_marker = "<｜tool▁call▁end｜>"
             tool_calls_end_marker = "<｜tool▁calls▁end｜>"
             too_calls_dict = {
-                "<｜tool_calls_begin｜>":"<｜tool▁calls▁begin｜>",
-                "<｜tool_call_begin｜>":"<｜tool▁call▁begin｜>",
-                "<｜tool_sep｜>":"<｜tool▁sep｜>",
-                "<｜tool_call_end｜>":"<｜tool▁call▁end｜>",
-                "<｜tool_calls_end｜>":"<｜tool▁calls▁end｜>"
+                "<tools▁begin>":"<｜tool▁calls▁begin｜>",
+                "<tool▁begin>":"<｜tool▁call▁begin｜>",
+                "<tool▁sep>":"<｜tool▁sep｜>",
+                "<tool▁end>":"<｜tool▁call▁end｜>",
+                "<tools▁end>":"<｜tool▁calls▁end｜>"
             }
             # Use check_client_connected for early stopping
             async for res in interface.inference(input_message, id, create.temperature, create.top_p):
